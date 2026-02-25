@@ -1,4 +1,4 @@
-##POWERED BY YIMING MENG AND NOAM MANDIN##
+
 
 import ctypes
 import os
@@ -12,9 +12,7 @@ try:
     vkdaq = ctypes.CDLL(dll_path)
 except OSError as e:
     print(f"Failed to load DLL: {e}")
-#####################################################
-###Make sure you have turned on the DAQ assistant.###
-#####################################################
+
 
 #Example of using char tasks[] data type   Satrt
     # buffer_size = 100

@@ -1,3 +1,7 @@
+##POWERED BY YIMING MENG AND NOAM MANDIN##
+#####################################################
+###Make sure you have turned on the DAQ assistant.###
+#####################################################
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse, HTMLResponse
