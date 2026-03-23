@@ -53,3 +53,22 @@ Once your hardware drivers are installed and your Python environment is ready, y
 If the main server isn't working or the data streams are empty, you can isolate the issue by running the test script. This will verify if Python can communicate with the hardware without the web server involved:
 
     python3 Testcodev0.py
+
+## 📊 VE3664N Noise Floor (uVrms)
+
+The following table shows the **noise floor (RMS, µV)** of the VE3664N DAQ device under different **input ranges** and **sampling rates**.
+
+| Input Range | 1.2 kS/s | 2.4 kS/s | 4.8 kS/s | 9.6 kS/s | 12.8 kS/s | 25.6 kS/s | 51.2 kS/s | 102.4 kS/s |
+|------------|----------|----------|----------|----------|------------|------------|------------|-------------|
+| ±10 V  | 120.6 µVrms | 181.6 µVrms | 244.0 µVrms | 478.2 µVrms | 490.7 µVrms | 856.6 µVrms | 1164.4 µVrms | 3548.6 µVrms |
+| ±5 V   | 61.0 µVrms  | 93.6 µVrms  | 122.0 µVrms | 192.0 µVrms | 253.0 µVrms | 350.7 µVrms | 566.2 µVrms  | 1774.3 µVrms |
+| ±2.5 V | 35.0 µVrms  | 46.6 µVrms  | 68.0 µVrms  | 98.1 µVrms  | 120.3 µVrms | 184.8 µVrms | 268.4 µVrms  | 887.8 µVrms  |
+| ±1 V   | 16.0 µVrms  | 22.4 µVrms  | 32.9 µVrms  | 52.5 µVrms  | 66.0 µVrms  | 90.2 µVrms  | 134.9 µVrms  | 443.9 µVrms  |
+| ±500 mV | 7.9 µVrms  | 11.9 µVrms  | 18.4 µVrms  | 29.1 µVrms  | 32.8 µVrms  | 50.5 µVrms  | 76.7 µVrms   | 221.9 µVrms  |
+| ±100 mV | 3.5 µVrms  | 4.8 µVrms   | 7.1 µVrms   | 10.7 µVrms  | 13.4 µVrms  | 18.4 µVrms  | 30.0 µVrms   | 72.1 µVrms   |
+| ±20 mV  | 2.8 µVrms  | 4.3 µVrms   | 5.8 µVrms   | 9.3 µVrms   | 10.0 µVrms  | 16.5 µVrms  | 23.7 µVrms   | 37.5 µVrms   |
+
+### 💡 Notes
+- Units: **µVrms (microvolts RMS)**
+- Noise increases with **sampling rate**
+- Lower input ranges generally provide **better noise performance**
