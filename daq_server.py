@@ -11,6 +11,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -33,6 +34,8 @@ INPUT_RANGES = {
 MIN_SAMPLE_RATE = 1.0
 MAX_SAMPLE_RATE = 102_400.0
 MAX_POINTS = 2_000_000
+MIN_HTTP_PORT = 1
+MAX_HTTP_PORT = 65_535
 PROJECT_DIR = Path(__file__).resolve().parent
 DEVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -64,6 +67,32 @@ def load_saved_settings(path: Path) -> tuple[dict[str, Any], str]:
         return payload, ""
     except (OSError, ValueError) as exc:
         return {}, f"Unable to load settings from {path}: {exc}"
+
+
+def local_address_for_display(bind_host: str) -> str:
+    if bind_host not in {"0.0.0.0", "::"}:
+        return bind_host
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            address = sock.getsockname()[0]
+            if address:
+                return address
+    except OSError:
+        pass
+    try:
+        address = socket.gethostbyname(socket.gethostname())
+        if address:
+            return address
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def dat_endpoint_addresses(host: str, port: int) -> list[str]:
+    display_host = local_address_for_display(host)
+    url_host = f"[{display_host}]" if ":" in display_host else display_host
+    return [f"http://{url_host}:{port}/ch{index}.dat" for index in range(1, 5)]
 
 
 def _first_existing_file(candidates: list[Path]) -> Path | None:
@@ -203,6 +232,13 @@ class DAQController:
         self.settings_path = settings_path
         self.settings_error = settings_error
         self.config = self._config_from_settings(saved_settings or {})
+        try:
+            saved_port = int((saved_settings or {}).get("http_port", 8001))
+            self.http_port = (
+                saved_port if MIN_HTTP_PORT <= saved_port <= MAX_HTTP_PORT else 8001
+            )
+        except (TypeError, ValueError):
+            self.http_port = 8001
         if force_simulation:
             self.config.simulation = True
         self.acquiring = False
@@ -435,6 +471,7 @@ class DAQController:
         with self.lock:
             return {
                 "version": 1,
+                "http_port": self.http_port,
                 "device_name": self.config.device_name,
                 "sample_rate": self.config.sample_rate,
                 "points": self.config.points,
@@ -468,6 +505,15 @@ class DAQController:
         except OSError as exc:
             self.settings_error = f"Unable to save settings to {self.settings_path}: {exc}"
             return False
+
+    def set_http_port(self, port: int) -> None:
+        if not MIN_HTTP_PORT <= port <= MAX_HTTP_PORT:
+            raise ValueError(
+                f"HTTP port must be between {MIN_HTTP_PORT} and {MAX_HTTP_PORT}"
+            )
+        with self.lock:
+            self.http_port = int(port)
+        self.save_settings()
 
     def start_worker(self) -> None:
         with self.lock:
@@ -589,6 +635,7 @@ class DAQController:
                 "status": self.status, "acquiring": self.acquiring,
                 "settings_path": str(self.settings_path) if self.settings_path else None,
                 "settings_error": self.settings_error,
+                "http_port": self.http_port,
                 "mode": "simulation" if self.config.simulation else "hardware",
                 "hardware_available": self.hardware_available,
                 "driver_path": str(self.driver_path) if self.driver_path else None,
@@ -795,11 +842,6 @@ def startup_event() -> None:
     controller.start_worker()
 
 
-@app.on_event("shutdown")
-def shutdown_event() -> None:
-    controller.shutdown()
-
-
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     status = controller.snapshot()
@@ -854,23 +896,107 @@ def get_ch4() -> PlainTextResponse:
     return _channel_response("AIN4")
 
 
+class HTTPServerManager:
+    """Start and restart Uvicorn when the user changes the HTTP port."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.port = port
+        self.server: uvicorn.Server | None = None
+        self.thread: threading.Thread | None = None
+        self.lock = threading.RLock()
+
+    def _port_available(self, port: int) -> bool:
+        family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
+        bind_host = self.host
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.bind((bind_host, port))
+            return True
+        except OSError:
+            return False
+
+    def start(self) -> None:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            config = uvicorn.Config(
+                app, host=self.host, port=self.port, log_level="info"
+            )
+            self.server = uvicorn.Server(config)
+            self.thread = threading.Thread(
+                target=self.server.run, name="http-server", daemon=True
+            )
+            self.thread.start()
+            server = self.server
+            thread = self.thread
+
+        deadline = time.time() + 4.0
+        while thread.is_alive() and not server.started and time.time() < deadline:
+            time.sleep(0.05)
+        if not server.started:
+            server.should_exit = True
+            thread.join(timeout=1.0)
+            raise RuntimeError(
+                f"Unable to start HTTP server on {self.host}:{self.port}"
+            )
+
+    def stop(self) -> None:
+        with self.lock:
+            server = self.server
+            thread = self.thread
+        if server is not None:
+            server.should_exit = True
+        if thread and thread.is_alive():
+            thread.join(timeout=4.0)
+        with self.lock:
+            self.server = None
+            self.thread = None
+
+    def restart(self, port: int) -> None:
+        if not MIN_HTTP_PORT <= port <= MAX_HTTP_PORT:
+            raise ValueError(
+                f"HTTP port must be between {MIN_HTTP_PORT} and {MAX_HTTP_PORT}"
+            )
+        if port == self.port:
+            return
+        if not self._port_available(port):
+            raise ValueError(f"HTTP port {port} is already in use")
+
+        previous_port = self.port
+        self.stop()
+        self.port = port
+        try:
+            self.start()
+        except Exception as exc:
+            self.port = previous_port
+            try:
+                self.start()
+            except Exception:
+                pass
+            raise ValueError(str(exc)) from exc
+
+
 class DAQControlWindow:
-    def __init__(self, daq_controller: DAQController, server: uvicorn.Server) -> None:
+    def __init__(
+        self, daq_controller: DAQController, server_manager: HTTPServerManager
+    ) -> None:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
         self.tk, self.ttk = tk, ttk
         self.filedialog, self.messagebox = filedialog, messagebox
-        self.controller, self.server = daq_controller, server
+        self.controller, self.server_manager = daq_controller, server_manager
         self.root = tk.Tk()
         self.root.title("VE3664N DAQ Controller")
-        self.root.geometry("760x700")
-        self.root.minsize(700, 650)
+        self.root.geometry("900x700")
+        self.root.minsize(800, 650)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         config = self.controller._config_snapshot()
         self.sample_rate_var = tk.StringVar(value=f"{config.sample_rate:g}")
         self.points_var = tk.StringVar(value=str(config.points))
         self.device_var = tk.StringVar(value=config.device_name)
+        self.port_var = tk.StringVar(value=str(self.server_manager.port))
         self.trigger_var = tk.StringVar(value=config.trigger_source)
         self.edge_var = tk.StringVar(value=config.trigger_edge)
         self.simulation_var = tk.BooleanVar(value=config.simulation)
@@ -887,7 +1013,7 @@ class DAQControlWindow:
         self.assistant_var = tk.StringVar(value="Starting")
         self.mode_var = tk.StringVar(value="")
         self.points_read_var = tk.StringVar(value="0")
-        self.capture_count_var = tk.StringVar(value="0")
+        self.endpoint_var = tk.StringVar(value=self._endpoint_text())
         self.error_var = tk.StringVar(value="")
         self._build_ui(config)
         self.root.after(200, self._refresh_status)
@@ -907,7 +1033,9 @@ class DAQControlWindow:
         self._status_row(status_frame, 1, "Mode:", self.mode_var)
         self._status_row(status_frame, 2, "DAQ Assistant:", self.assistant_var)
         self._status_row(status_frame, 3, "Last sample count:", self.points_read_var)
-        self._status_row(status_frame, 4, "Captured frames:", self.capture_count_var)
+        self._status_row(
+            status_frame, 4, "DAT addresses:", self.endpoint_var, wraplength=700
+        )
 
         settings = ttk.LabelFrame(root_frame, text="Acquisition Settings", padding=10)
         settings.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -929,7 +1057,14 @@ class DAQControlWindow:
         edge_frame.grid(row=2, column=1, sticky="w", pady=5)
         ttk.Radiobutton(edge_frame, text="Rising", variable=self.edge_var, value="rising").pack(side="left")
         ttk.Radiobutton(edge_frame, text="Falling", variable=self.edge_var, value="falling").pack(side="left", padx=(12, 0))
-        ttk.Checkbutton(settings, text="Simulation mode", variable=self.simulation_var).grid(row=2, column=2, columnspan=2, sticky="w", pady=5)
+        ttk.Checkbutton(edge_frame, text="Simulation mode",
+                        variable=self.simulation_var).pack(side="left", padx=(24, 0))
+        ttk.Label(settings, text="HTTP port").grid(
+            row=2, column=2, sticky="w", padx=(0, 8), pady=5
+        )
+        ttk.Entry(settings, textvariable=self.port_var).grid(
+            row=2, column=3, sticky="ew", pady=5
+        )
 
         channels_frame = ttk.LabelFrame(root_frame, text="Analog Input Channels", padding=10)
         channels_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
@@ -961,9 +1096,20 @@ class DAQControlWindow:
         ttk.Label(root_frame, textvariable=self.error_var, foreground="#b00020",
                   wraplength=700).grid(row=5, column=0, sticky="ew")
 
-    def _status_row(self, frame: Any, row: int, label: str, variable: Any) -> None:
+    def _status_row(
+        self, frame: Any, row: int, label: str, variable: Any,
+        wraplength: int = 0,
+    ) -> None:
         self.ttk.Label(frame, text=label).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=2)
-        self.ttk.Label(frame, textvariable=variable).grid(row=row, column=1, sticky="nw", pady=2)
+        self.ttk.Label(
+            frame, textvariable=variable, wraplength=wraplength,
+            justify="left",
+        ).grid(row=row, column=1, sticky="nw", pady=2)
+
+    def _endpoint_text(self) -> str:
+        return "  |  ".join(
+            dat_endpoint_addresses(self.server_manager.host, self.server_manager.port)
+        )
 
     def open_paths_dialog(self) -> None:
         existing = getattr(self, "paths_dialog", None)
@@ -1052,6 +1198,11 @@ class DAQControlWindow:
 
     def apply_config(self, show_confirmation: bool = True) -> bool:
         try:
+            port = int(self.port_var.get())
+            if not MIN_HTTP_PORT <= port <= MAX_HTTP_PORT:
+                raise ValueError(
+                    f"HTTP port must be between {MIN_HTTP_PORT} and {MAX_HTTP_PORT}"
+                )
             channels = {name: ChannelConfig(
                 enabled=bool(self.channel_enabled_vars[name].get()),
                 voltage_range=INPUT_RANGES[self.channel_range_vars[name].get()])
@@ -1062,6 +1213,10 @@ class DAQControlWindow:
                 trigger_source=self.trigger_var.get(), trigger_edge=self.edge_var.get(),
                 simulation=bool(self.simulation_var.get()), channels=channels,
             )
+            if port != self.server_manager.port:
+                self.server_manager.restart(port)
+            self.controller.set_http_port(port)
+            self.endpoint_var.set(self._endpoint_text())
             self.error_var.set("")
             if show_confirmation:
                 self.status_var.set("Settings applied")
@@ -1086,7 +1241,7 @@ class DAQControlWindow:
         )
         self.assistant_var.set(snapshot["assistant_status"])
         self.points_read_var.set(str(snapshot["points_read"]))
-        self.capture_count_var.set(str(snapshot["capture_count"]))
+        self.endpoint_var.set(self._endpoint_text())
         error_messages = [snapshot["last_error"]]
         if not snapshot["hardware_available"]:
             error_messages.append(snapshot["driver_error"])
@@ -1095,8 +1250,8 @@ class DAQControlWindow:
         self.root.after(250, self._refresh_status)
 
     def close(self) -> None:
+        self.server_manager.stop()
         self.controller.shutdown()
-        self.server.should_exit = True
         self.root.destroy()
 
     def run(self) -> None:
@@ -1109,7 +1264,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-ui", action="store_true", help="run only the HTTP server")
     parser.add_argument("--no-assistant", action="store_true", help="do not launch DAQ Assistant")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument("--port", type=int, default=None,
+                        help="override the saved HTTP port")
     return parser.parse_args()
 
 
@@ -1118,20 +1274,25 @@ def main() -> None:
     if args.simulation:
         with controller.lock:
             controller.config.simulation = True
+    port = args.port if args.port is not None else controller.http_port
+    if not MIN_HTTP_PORT <= port <= MAX_HTTP_PORT:
+        raise ValueError(f"HTTP port must be between {MIN_HTTP_PORT} and {MAX_HTTP_PORT}")
+    controller.set_http_port(port)
     if not args.no_assistant:
         controller.launch_assistant()
     if args.no_ui:
-        uvicorn.run(app, host=args.host, port=args.port)
+        try:
+            uvicorn.run(app, host=args.host, port=port)
+        finally:
+            controller.shutdown()
         return
 
-    config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
-    server = uvicorn.Server(config)
-    server_thread = threading.Thread(target=server.run, name="http-server", daemon=True)
-    server_thread.start()
+    server_manager = HTTPServerManager(args.host, port)
+    server_manager.start()
     try:
-        DAQControlWindow(controller, server).run()
+        DAQControlWindow(controller, server_manager).run()
     except Exception as exc:
-        server.should_exit = True
+        server_manager.stop()
         controller.shutdown()
         print(f"Unable to start local UI: {exc}", file=sys.stderr)
         raise

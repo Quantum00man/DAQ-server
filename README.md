@@ -58,6 +58,8 @@ Once your hardware drivers are installed and your Python environment is ready, y
    * enter any sampling rate from 1 to 102400 Hz;
    * change the number of points acquired after each trigger;
    * choose DIN1.1 through DIN1.4 and a rising or falling trigger edge;
+   * configure the HTTP server port and see the current `ch1.dat` through `ch4.dat`
+     addresses in the main window;
    * apply parameters and start or stop acquisition; and
    * use simulated data when the driver or hardware is unavailable.
 4. The HTTP server remains available on port `8001`:
@@ -116,7 +118,7 @@ Use **Browse...** to select a file, or type/paste an absolute path into either f
 ### Saved JSON settings
 
 The controller saves all UI settings automatically when settings or paths are applied
-and when the application closes. This includes the device name, sample rate, points per
+and when the application closes. This includes the HTTP port, device name, sample rate, points per
 trigger, trigger input and edge, simulation mode, every channel's enabled state and
 input range, the driver/wrapper path, and the DAQ Assistant path.
 
@@ -127,6 +129,10 @@ The JSON file is stored at:
 
 Set `DAQ_SERVER_CONFIG` before starting the controller to use a different JSON path.
 The saved configuration is validated and restored automatically at the next launch.
+The default HTTP port is `8001`. A saved port is used automatically; `--port PORT` can
+override it from the command line and save the new value. Applying a new port in the UI restarts
+the embedded HTTP server. If the port is occupied, the current server remains active
+and the UI reports the conflict.
 
 ### 🛠️ Troubleshooting & Testing
 
