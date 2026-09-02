@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.util
 import math
 import os
 import random
@@ -165,7 +166,9 @@ class DAQController:
         self.needs_reinit = True
         self.worker_thread: threading.Thread | None = None
         self.driver: Any | None = None
+        self.driver_wrapper_path = PROJECT_DIR / "libvkdaq.py"
         self.driver_path = find_vkdaq_library()
+        self._dll_directory_handles: list[Any] = []
         self.driver_error = ""
         self.assistant_path = find_daq_assistant()
         self.assistant_process: subprocess.Popen[Any] | None = None
@@ -182,6 +185,37 @@ class DAQController:
     def hardware_available(self) -> bool:
         return self.driver is not None
 
+    @staticmethod
+    def _validate_driver_module(module: Any) -> None:
+        required = (
+            "VkDaqCreateTask", "VkDaqClearTask", "VkDaqStartTask",
+            "VkDaqStopTask", "VkDaqCreateAIVoltageChan",
+            "VkDaqCfgSampClkTiming", "VkDaqCfgDigEdgeRefTrig",
+            "VkDaqGetTaskData",
+        )
+        missing = [name for name in required if not hasattr(module, name)]
+        if missing:
+            raise ImportError(
+                "Selected wrapper is missing required functions: "
+                + ", ".join(missing)
+            )
+
+    def _import_driver_wrapper(self, wrapper_path: Path) -> Any:
+        module_name = f"_vkdaq_wrapper_{id(self)}_{time.time_ns()}"
+        spec = importlib.util.spec_from_file_location(module_name, wrapper_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to import wrapper: {wrapper_path}")
+        module = importlib.util.module_from_spec(spec)
+        wrapper_directory = str(wrapper_path.parent)
+        sys.path.insert(0, wrapper_directory)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            if sys.path and sys.path[0] == wrapper_directory:
+                sys.path.pop(0)
+        self._validate_driver_module(module)
+        return module
+
     def _load_driver(self) -> None:
         if self.driver_path is None:
             expected = "libvkdaq.dll or vkdaq.dll" if sys.platform.startswith("win") \
@@ -194,12 +228,80 @@ class DAQController:
             return
         try:
             os.environ["VKDAQ_LIBRARY"] = str(self.driver_path)
-            import libvkdaq
-            self.driver = libvkdaq
+            self.driver = self._import_driver_wrapper(self.driver_wrapper_path)
+            self.driver_error = ""
         except BaseException as exc:
             self.driver = None
             self.driver_error = str(exc)
             self.config.simulation = True
+
+    def reload_driver(self, selected_path: str) -> Path:
+        """Load a manually selected libvkdaq.py or native .so/.dll file."""
+        with self.lock:
+            if self.acquiring:
+                raise ValueError("Stop acquisition before changing the DAQ driver")
+
+        text = selected_path.strip()
+        if text:
+            path = Path(text).expanduser().resolve()
+            if not path.is_file():
+                raise ValueError(f"Driver or wrapper file not found: {path}")
+            if path.suffix.lower() == ".py":
+                wrapper_path = path
+                native_path = None
+                if sys.platform.startswith("win") and hasattr(os, "add_dll_directory"):
+                    self._dll_directory_handles.append(
+                        os.add_dll_directory(str(path.parent))
+                    )
+            elif path.suffix.lower() in {".dll", ".so", ".dylib"}:
+                wrapper_path = PROJECT_DIR / "libvkdaq.py"
+                native_path = path
+            else:
+                raise ValueError(
+                    "Select libvkdaq.py, libvkdaq.so, libvkdaq.dll, or vkdaq.dll"
+                )
+        else:
+            wrapper_path = PROJECT_DIR / "libvkdaq.py"
+            native_path = find_vkdaq_library()
+            if native_path is None:
+                raise ValueError(
+                    "No DAQ library was found automatically. Select a wrapper or driver file."
+                )
+
+        try:
+            if native_path is not None:
+                os.environ["VKDAQ_LIBRARY"] = str(native_path)
+            module = self._import_driver_wrapper(wrapper_path)
+        except BaseException as exc:
+            with self.lock:
+                self.driver = None
+                self.driver_wrapper_path = wrapper_path
+                self.driver_path = native_path
+                self.driver_error = f"Failed to load DAQ driver: {exc}"
+                self.config.simulation = True
+            raise ValueError(self.driver_error) from exc
+
+        reported_path = getattr(module, "VKDAQ_LIBRARY_PATH", None)
+        with self.lock:
+            self.driver = module
+            self.driver_wrapper_path = wrapper_path
+            self.driver_path = Path(reported_path).resolve() if reported_path else native_path
+            self.driver_error = ""
+            self.config.simulation = False
+            self.needs_reinit = True
+            self.status = "Driver loaded"
+        return wrapper_path if native_path is None else native_path
+
+    def set_assistant_path(self, selected_path: str) -> Path:
+        """Set an Assistant executable selected in the UI, or re-run discovery."""
+        text = selected_path.strip()
+        path = Path(text).expanduser().resolve() if text else find_daq_assistant()
+        if path is None or not path.is_file():
+            raise ValueError(f"DAQ Assistant executable not found: {text or 'automatic search'}")
+        with self.lock:
+            self.assistant_path = path
+            self.assistant_status = "Path set"
+        return path
 
     def start_worker(self) -> None:
         with self.lock:
@@ -314,6 +416,7 @@ class DAQController:
                 "mode": "simulation" if self.config.simulation else "hardware",
                 "hardware_available": self.hardware_available,
                 "driver_path": str(self.driver_path) if self.driver_path else None,
+                "driver_wrapper_path": str(self.driver_wrapper_path),
                 "driver_error": self.driver_error,
                 "assistant_path": (
                     str(self.assistant_path) if self.assistant_path else None
@@ -562,13 +665,14 @@ def get_ch4() -> PlainTextResponse:
 class DAQControlWindow:
     def __init__(self, daq_controller: DAQController, server: uvicorn.Server) -> None:
         import tkinter as tk
-        from tkinter import messagebox, ttk
-        self.tk, self.ttk, self.messagebox = tk, ttk, messagebox
+        from tkinter import filedialog, messagebox, ttk
+        self.tk, self.ttk = tk, ttk
+        self.filedialog, self.messagebox = filedialog, messagebox
         self.controller, self.server = daq_controller, server
         self.root = tk.Tk()
         self.root.title("VE3664N DAQ Controller")
-        self.root.geometry("720x600")
-        self.root.minsize(680, 560)
+        self.root.geometry("760x700")
+        self.root.minsize(700, 650)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         config = self.controller._config_snapshot()
@@ -577,6 +681,13 @@ class DAQControlWindow:
         self.trigger_var = tk.StringVar(value=config.trigger_source)
         self.edge_var = tk.StringVar(value=config.trigger_edge)
         self.simulation_var = tk.BooleanVar(value=config.simulation)
+        initial_driver_path = (
+            self.controller.driver_path or self.controller.driver_wrapper_path
+        )
+        self.driver_path_var = tk.StringVar(value=str(initial_driver_path))
+        self.assistant_path_var = tk.StringVar(
+            value=str(self.controller.assistant_path or "")
+        )
         self.channel_enabled_vars: dict[str, Any] = {}
         self.channel_range_vars: dict[str, Any] = {}
         self.status_var = tk.StringVar(value="Starting")
@@ -648,12 +759,99 @@ class DAQControlWindow:
         ttk.Button(button_frame, text="Stop Acquisition", command=self.stop).pack(side="left", padx=(8, 0))
         ttk.Button(button_frame, text="Launch DAQ Assistant",
                    command=self.controller.launch_assistant).pack(side="right")
+        ttk.Button(button_frame, text="Device Paths...",
+                   command=self.open_paths_dialog).pack(side="right", padx=(0, 8))
         ttk.Label(root_frame, textvariable=self.error_var, foreground="#b00020",
-                  wraplength=660).grid(row=5, column=0, sticky="ew")
+                  wraplength=700).grid(row=5, column=0, sticky="ew")
 
     def _status_row(self, frame: Any, row: int, label: str, variable: Any) -> None:
         self.ttk.Label(frame, text=label).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=2)
         self.ttk.Label(frame, textvariable=variable).grid(row=row, column=1, sticky="nw", pady=2)
+
+    def open_paths_dialog(self) -> None:
+        existing = getattr(self, "paths_dialog", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        dialog = self.tk.Toplevel(self.root)
+        self.paths_dialog = dialog
+        dialog.title("Device Paths")
+        dialog.geometry("780x150")
+        dialog.minsize(680, 140)
+        dialog.transient(self.root)
+        frame = self.ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        self.ttk.Label(frame, text="libvkdaq.py / native driver").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=6
+        )
+        self.ttk.Entry(frame, textvariable=self.driver_path_var).grid(
+            row=0, column=1, sticky="ew", pady=6
+        )
+        self.ttk.Button(frame, text="Browse...", command=self.browse_driver).grid(
+            row=0, column=2, padx=(8, 0), pady=6
+        )
+        self.ttk.Button(frame, text="Load Driver", command=self.load_driver).grid(
+            row=0, column=3, padx=(8, 0), pady=6
+        )
+        self.ttk.Label(frame, text="VkDaqAssistant executable").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=6
+        )
+        self.ttk.Entry(frame, textvariable=self.assistant_path_var).grid(
+            row=1, column=1, sticky="ew", pady=6
+        )
+        self.ttk.Button(frame, text="Browse...", command=self.browse_assistant).grid(
+            row=1, column=2, padx=(8, 0), pady=6
+        )
+        self.ttk.Button(frame, text="Set Path", command=self.set_assistant_path).grid(
+            row=1, column=3, padx=(8, 0), pady=6
+        )
+
+    def browse_driver(self) -> None:
+        path = self.filedialog.askopenfilename(
+            title="Select libvkdaq wrapper or native driver",
+            filetypes=(
+                ("Vkinging DAQ files", "libvkdaq.py libvkdaq.so libvkdaq.dll vkdaq.dll"),
+                ("Python files", "*.py"),
+                ("Shared libraries", "*.so *.dll *.dylib"),
+                ("All files", "*"),
+            ),
+        )
+        if path:
+            self.driver_path_var.set(path)
+
+    def browse_assistant(self) -> None:
+        path = self.filedialog.askopenfilename(
+            title="Select VkDaqAssistant executable",
+            filetypes=(("VkDaqAssistant", "VkDaqAssistant VkDaqAssistant.exe"),
+                       ("All files", "*")),
+        )
+        if path:
+            self.assistant_path_var.set(path)
+
+    def load_driver(self) -> None:
+        try:
+            loaded_path = self.controller.reload_driver(self.driver_path_var.get())
+            self.driver_path_var.set(str(loaded_path))
+            self.simulation_var.set(False)
+            self.error_var.set("")
+            self.status_var.set("Driver loaded")
+        except ValueError as exc:
+            self.simulation_var.set(True)
+            self.error_var.set(str(exc))
+            self.messagebox.showerror("Driver Load Error", str(exc))
+
+    def set_assistant_path(self) -> None:
+        try:
+            path = self.controller.set_assistant_path(self.assistant_path_var.get())
+            self.assistant_path_var.set(str(path))
+            self.assistant_var.set("Path set")
+            self.error_var.set("")
+        except ValueError as exc:
+            self.error_var.set(str(exc))
+            self.messagebox.showerror("Assistant Path Error", str(exc))
 
     def apply_config(self, show_confirmation: bool = True) -> bool:
         try:

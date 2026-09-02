@@ -102,6 +102,16 @@ PowerShell before launching the controller:
 Keep dependent vendor DLLs beside `libvkdaq.dll`; Python registers that directory for
 Windows DLL dependency loading automatically.
 
+The same paths can be selected directly in the **Device Paths** section of the UI:
+
+* **libvkdaq.py / native driver** accepts a vendor `libvkdaq.py` wrapper or a native
+  `libvkdaq.so`, `libvkdaq.dll`, or `vkdaq.dll` file. Stop acquisition before loading
+  a different driver.
+* **VkDaqAssistant executable** accepts `VkDaqAssistant` on Linux or
+  `VkDaqAssistant.exe` on Windows. After setting the path, use **Launch DAQ Assistant**.
+
+Use **Browse...** to select a file, or type/paste an absolute path into either field.
+
 ### 🛠️ Troubleshooting & Testing
 
 If the main server isn't working or the data streams are empty, you can isolate the issue by running the test script. This will verify if Python can communicate with the hardware without the web server involved:
