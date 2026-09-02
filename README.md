@@ -53,6 +53,7 @@ Once your hardware drivers are installed and your Python environment is ready, y
    password in the terminal if requested. On Windows, it searches for and starts
    `VkDaqAssistant.exe` directly. The local control window then lets you:
    * enable any combination of AIN1 through AIN4;
+   * select `dev1`, `dev2`, or enter another DAQ device name;
    * select an independent voltage range for every channel;
    * enter any sampling rate from 1 to 102400 Hz;
    * change the number of points acquired after each trigger;
@@ -102,7 +103,7 @@ PowerShell before launching the controller:
 Keep dependent vendor DLLs beside `libvkdaq.dll`; Python registers that directory for
 Windows DLL dependency loading automatically.
 
-The same paths can be selected directly in the **Device Paths** section of the UI:
+The same paths can be selected from the UI's **Device Paths...** dialog:
 
 * **libvkdaq.py / native driver** accepts a vendor `libvkdaq.py` wrapper or a native
   `libvkdaq.so`, `libvkdaq.dll`, or `vkdaq.dll` file. Stop acquisition before loading
@@ -111,6 +112,21 @@ The same paths can be selected directly in the **Device Paths** section of the U
   `VkDaqAssistant.exe` on Windows. After setting the path, use **Launch DAQ Assistant**.
 
 Use **Browse...** to select a file, or type/paste an absolute path into either field.
+
+### Saved JSON settings
+
+The controller saves all UI settings automatically when settings or paths are applied
+and when the application closes. This includes the device name, sample rate, points per
+trigger, trigger input and edge, simulation mode, every channel's enabled state and
+input range, the driver/wrapper path, and the DAQ Assistant path.
+
+The JSON file is stored at:
+
+* Linux: `~/.config/DAQ-server/config.json`
+* Windows: `%APPDATA%\DAQ-server\config.json`
+
+Set `DAQ_SERVER_CONFIG` before starting the controller to use a different JSON path.
+The saved configuration is validated and restored automatically at the next launch.
 
 ### 🛠️ Troubleshooting & Testing
 

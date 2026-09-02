@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import ctypes
 import importlib.util
+import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +34,36 @@ MIN_SAMPLE_RATE = 1.0
 MAX_SAMPLE_RATE = 102_400.0
 MAX_POINTS = 2_000_000
 PROJECT_DIR = Path(__file__).resolve().parent
+DEVICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def default_settings_path(
+    platform_name: str | None = None,
+    environ: dict[str, str] | os._Environ[str] | None = None,
+) -> Path:
+    platform_name = platform_name or sys.platform
+    environ = os.environ if environ is None else environ
+    explicit = environ.get("DAQ_SERVER_CONFIG")
+    if explicit:
+        return Path(explicit).expanduser()
+    if platform_name.startswith("win"):
+        base = Path(environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    else:
+        base = Path(environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "DAQ-server" / "config.json"
+
+
+def load_saved_settings(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.is_file():
+        return {}, ""
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        if not isinstance(payload, dict):
+            raise ValueError("the JSON root must be an object")
+        return payload, ""
+    except (OSError, ValueError) as exc:
+        return {}, f"Unable to load settings from {path}: {exc}"
 
 
 def _first_existing_file(candidates: list[Path]) -> Path | None:
@@ -143,6 +175,7 @@ class ChannelConfig:
 
 @dataclass
 class AcquisitionConfig:
+    device_name: str = "dev1"
     sample_rate: float = 3990.0
     points: int = 390
     trigger_source: str = "DIN1.1"
@@ -157,17 +190,30 @@ class AcquisitionConfig:
 class DAQController:
     """Owns DAQ state and serializes hardware access in one worker thread."""
 
-    def __init__(self, force_simulation: bool = False) -> None:
+    def __init__(
+        self,
+        force_simulation: bool = False,
+        saved_settings: dict[str, Any] | None = None,
+        settings_path: Path | None = None,
+        settings_error: str = "",
+    ) -> None:
         self.lock = threading.RLock()
         self.wake_event = threading.Event()
         self.shutdown_event = threading.Event()
-        self.config = AcquisitionConfig(simulation=force_simulation)
+        self.settings_path = settings_path
+        self.settings_error = settings_error
+        self.config = self._config_from_settings(saved_settings or {})
+        if force_simulation:
+            self.config.simulation = True
         self.acquiring = False
         self.needs_reinit = True
         self.worker_thread: threading.Thread | None = None
         self.driver: Any | None = None
         self.driver_wrapper_path = PROJECT_DIR / "libvkdaq.py"
         self.driver_path = find_vkdaq_library()
+        self.driver_selection_path: Path = (
+            self.driver_path or self.driver_wrapper_path
+        )
         self._dll_directory_handles: list[Any] = []
         self.driver_error = ""
         self.assistant_path = find_daq_assistant()
@@ -179,7 +225,77 @@ class DAQController:
         self.capture_count = 0
         self.timestamp = 0.0
         self.data: dict[str, list[float] | None] = {name: None for name in CHANNEL_NAMES}
+        self._restore_saved_paths(saved_settings or {})
         self._load_driver()
+
+    @staticmethod
+    def _config_from_settings(settings: dict[str, Any]) -> AcquisitionConfig:
+        config = AcquisitionConfig()
+        device_name = str(settings.get("device_name", config.device_name)).strip()
+        if DEVICE_NAME_PATTERN.fullmatch(device_name):
+            config.device_name = device_name
+        try:
+            sample_rate = float(settings.get("sample_rate", config.sample_rate))
+            if MIN_SAMPLE_RATE <= sample_rate <= MAX_SAMPLE_RATE:
+                config.sample_rate = sample_rate
+        except (TypeError, ValueError):
+            pass
+        try:
+            points = int(settings.get("points", config.points))
+            if 1 <= points <= MAX_POINTS:
+                config.points = points
+        except (TypeError, ValueError):
+            pass
+        trigger_source = settings.get("trigger_source")
+        if trigger_source in TRIGGER_SOURCES:
+            config.trigger_source = trigger_source
+        trigger_edge = settings.get("trigger_edge")
+        if trigger_edge in {"rising", "falling"}:
+            config.trigger_edge = trigger_edge
+        if isinstance(settings.get("simulation"), bool):
+            config.simulation = settings["simulation"]
+
+        saved_channels = settings.get("channels")
+        if isinstance(saved_channels, dict):
+            for name, channel in config.channels.items():
+                saved_channel = saved_channels.get(name)
+                if not isinstance(saved_channel, dict):
+                    continue
+                if isinstance(saved_channel.get("enabled"), bool):
+                    channel.enabled = saved_channel["enabled"]
+                try:
+                    voltage_range = float(saved_channel.get("range"))
+                    if voltage_range in INPUT_RANGES.values():
+                        channel.voltage_range = voltage_range
+                except (TypeError, ValueError):
+                    pass
+            if not any(channel.enabled for channel in config.channels.values()):
+                config.channels["AIN1"].enabled = True
+        return config
+
+    def _restore_saved_paths(self, settings: dict[str, Any]) -> None:
+        selected_driver = settings.get("driver_or_wrapper_path")
+        if isinstance(selected_driver, str) and selected_driver.strip():
+            path = Path(selected_driver).expanduser()
+            if path.is_file():
+                path = path.resolve()
+                if path.suffix.lower() == ".py":
+                    self.driver_wrapper_path = path
+                    if path != (PROJECT_DIR / "libvkdaq.py").resolve():
+                        self.driver_path = None
+                    self.driver_selection_path = path
+                elif path.suffix.lower() in {".dll", ".so", ".dylib"}:
+                    self.driver_path = path
+                    self.driver_selection_path = path
+            else:
+                self.settings_error = f"Saved driver path not found: {path}"
+        selected_assistant = settings.get("assistant_path")
+        if isinstance(selected_assistant, str) and selected_assistant.strip():
+            path = Path(selected_assistant).expanduser()
+            if path.is_file():
+                self.assistant_path = path.resolve()
+            elif not self.settings_error:
+                self.settings_error = f"Saved DAQ Assistant path not found: {path}"
 
     @property
     def hardware_available(self) -> bool:
@@ -217,7 +333,10 @@ class DAQController:
         return module
 
     def _load_driver(self) -> None:
-        if self.driver_path is None:
+        using_bundled_wrapper = (
+            self.driver_wrapper_path.resolve() == (PROJECT_DIR / "libvkdaq.py").resolve()
+        )
+        if self.driver_path is None and using_bundled_wrapper:
             expected = "libvkdaq.dll or vkdaq.dll" if sys.platform.startswith("win") \
                 else "libvkdaq.so"
             self.driver = None
@@ -227,8 +346,12 @@ class DAQController:
             self.config.simulation = True
             return
         try:
-            os.environ["VKDAQ_LIBRARY"] = str(self.driver_path)
+            if self.driver_path is not None:
+                os.environ["VKDAQ_LIBRARY"] = str(self.driver_path)
             self.driver = self._import_driver_wrapper(self.driver_wrapper_path)
+            reported_path = getattr(self.driver, "VKDAQ_LIBRARY_PATH", None)
+            if reported_path:
+                self.driver_path = Path(reported_path).resolve()
             self.driver_error = ""
         except BaseException as exc:
             self.driver = None
@@ -267,6 +390,7 @@ class DAQController:
                 raise ValueError(
                     "No DAQ library was found automatically. Select a wrapper or driver file."
                 )
+        selection_path = path if text else (native_path or wrapper_path)
 
         try:
             if native_path is not None:
@@ -277,6 +401,7 @@ class DAQController:
                 self.driver = None
                 self.driver_wrapper_path = wrapper_path
                 self.driver_path = native_path
+                self.driver_selection_path = selection_path
                 self.driver_error = f"Failed to load DAQ driver: {exc}"
                 self.config.simulation = True
             raise ValueError(self.driver_error) from exc
@@ -286,11 +411,13 @@ class DAQController:
             self.driver = module
             self.driver_wrapper_path = wrapper_path
             self.driver_path = Path(reported_path).resolve() if reported_path else native_path
+            self.driver_selection_path = selection_path
             self.driver_error = ""
             self.config.simulation = False
             self.needs_reinit = True
             self.status = "Driver loaded"
-        return wrapper_path if native_path is None else native_path
+        self.save_settings()
+        return self.driver_selection_path
 
     def set_assistant_path(self, selected_path: str) -> Path:
         """Set an Assistant executable selected in the UI, or re-run discovery."""
@@ -301,7 +428,46 @@ class DAQController:
         with self.lock:
             self.assistant_path = path
             self.assistant_status = "Path set"
+        self.save_settings()
         return path
+
+    def _settings_payload(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "version": 1,
+                "device_name": self.config.device_name,
+                "sample_rate": self.config.sample_rate,
+                "points": self.config.points,
+                "trigger_source": self.config.trigger_source,
+                "trigger_edge": self.config.trigger_edge,
+                "simulation": self.config.simulation,
+                "channels": {
+                    name: {
+                        "enabled": channel.enabled,
+                        "range": channel.voltage_range,
+                    }
+                    for name, channel in self.config.channels.items()
+                },
+                "driver_or_wrapper_path": str(self.driver_selection_path),
+                "assistant_path": str(self.assistant_path) if self.assistant_path else "",
+            }
+
+    def save_settings(self) -> bool:
+        if self.settings_path is None:
+            return True
+        payload = self._settings_payload()
+        temporary_path = self.settings_path.with_name(self.settings_path.name + ".tmp")
+        try:
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary_path.open("w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2, ensure_ascii=False)
+                stream.write("\n")
+            os.replace(temporary_path, self.settings_path)
+            self.settings_error = ""
+            return True
+        except OSError as exc:
+            self.settings_error = f"Unable to save settings to {self.settings_path}: {exc}"
+            return False
 
     def start_worker(self) -> None:
         with self.lock:
@@ -314,9 +480,14 @@ class DAQController:
             self.worker_thread.start()
 
     def update_config(
-        self, *, sample_rate: float, points: int, trigger_source: str,
+        self, *, device_name: str, sample_rate: float, points: int, trigger_source: str,
         trigger_edge: str, simulation: bool, channels: dict[str, ChannelConfig],
     ) -> None:
+        device_name = device_name.strip()
+        if not DEVICE_NAME_PATTERN.fullmatch(device_name):
+            raise ValueError(
+                "Device name may contain only letters, numbers, dots, underscores, and hyphens"
+            )
         if not MIN_SAMPLE_RATE <= sample_rate <= MAX_SAMPLE_RATE:
             raise ValueError(
                 f"Sample rate must be between {MIN_SAMPLE_RATE:g} and "
@@ -337,6 +508,7 @@ class DAQController:
 
         with self.lock:
             self.config = AcquisitionConfig(
+                device_name=device_name,
                 sample_rate=float(sample_rate), points=int(points),
                 trigger_source=trigger_source, trigger_edge=trigger_edge,
                 simulation=bool(simulation),
@@ -349,6 +521,7 @@ class DAQController:
                     self.data[name] = None
             self.last_error = ""
         self.wake_event.set()
+        self.save_settings()
 
     def start_acquisition(self) -> None:
         with self.lock:
@@ -366,6 +539,7 @@ class DAQController:
         self.wake_event.set()
 
     def shutdown(self) -> None:
+        self.save_settings()
         self.shutdown_event.set()
         self.stop_acquisition()
         thread = self.worker_thread
@@ -413,6 +587,8 @@ class DAQController:
                 self.assistant_status = assistant_status
             return {
                 "status": self.status, "acquiring": self.acquiring,
+                "settings_path": str(self.settings_path) if self.settings_path else None,
+                "settings_error": self.settings_error,
                 "mode": "simulation" if self.config.simulation else "hardware",
                 "hardware_available": self.hardware_available,
                 "driver_path": str(self.driver_path) if self.driver_path else None,
@@ -422,6 +598,7 @@ class DAQController:
                     str(self.assistant_path) if self.assistant_path else None
                 ),
                 "assistant_status": assistant_status,
+                "device_name": self.config.device_name,
                 "sample_rate": self.config.sample_rate,
                 "points_requested": self.config.points,
                 "points_read": self.last_points,
@@ -445,6 +622,7 @@ class DAQController:
     def _config_snapshot(self) -> AcquisitionConfig:
         with self.lock:
             return AcquisitionConfig(
+                device_name=self.config.device_name,
                 sample_rate=self.config.sample_rate, points=self.config.points,
                 trigger_source=self.config.trigger_source,
                 trigger_edge=self.config.trigger_edge,
@@ -529,7 +707,9 @@ class DAQController:
                 if not channel.enabled:
                     continue
                 result = self.driver.VkDaqCreateAIVoltageChan(
-                    task_pointer, ctypes.c_char_p(f"dev1/{name}".encode()), ctypes.c_char_p(b""),
+                    task_pointer,
+                    ctypes.c_char_p(f"{config.device_name}/{name}".encode()),
+                    ctypes.c_char_p(b""),
                     0, -channel.voltage_range, channel.voltage_range, 0, ctypes.c_char_p(b""),
                 )
                 self._check_result(result, f"Configure {name}")
@@ -539,7 +719,12 @@ class DAQController:
             self._check_result(result, "Configure sample clock")
             edge = 1 if config.trigger_edge == "rising" else 0
             result = self.driver.VkDaqCfgDigEdgeRefTrig(
-                task_pointer, ctypes.c_char_p(f"dev1/{config.trigger_source}".encode()), edge, 0
+                task_pointer,
+                ctypes.c_char_p(
+                    f"{config.device_name}/{config.trigger_source}".encode()
+                ),
+                edge,
+                0,
             )
             self._check_result(result, "Configure digital trigger")
             self._check_result(self.driver.VkDaqStartTask(task_pointer), "Start DAQ task")
@@ -595,7 +780,13 @@ class DAQController:
             self.last_error = ""
 
 
-controller = DAQController()
+SETTINGS_PATH = default_settings_path()
+SAVED_SETTINGS, SETTINGS_LOAD_ERROR = load_saved_settings(SETTINGS_PATH)
+controller = DAQController(
+    saved_settings=SAVED_SETTINGS,
+    settings_path=SETTINGS_PATH,
+    settings_error=SETTINGS_LOAD_ERROR,
+)
 app = FastAPI(title="VE3664N DAQ Server")
 
 
@@ -629,6 +820,7 @@ def configure(sample_rate: float = 3990, points: int = 400) -> dict[str, str]:
     current = controller._config_snapshot()
     try:
         controller.update_config(
+            device_name=current.device_name,
             sample_rate=sample_rate, points=points,
             trigger_source=current.trigger_source, trigger_edge=current.trigger_edge,
             simulation=current.simulation, channels=current.channels,
@@ -678,6 +870,7 @@ class DAQControlWindow:
         config = self.controller._config_snapshot()
         self.sample_rate_var = tk.StringVar(value=f"{config.sample_rate:g}")
         self.points_var = tk.StringVar(value=str(config.points))
+        self.device_var = tk.StringVar(value=config.device_name)
         self.trigger_var = tk.StringVar(value=config.trigger_source)
         self.edge_var = tk.StringVar(value=config.trigger_edge)
         self.simulation_var = tk.BooleanVar(value=config.simulation)
@@ -720,9 +913,13 @@ class DAQControlWindow:
         settings.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         settings.columnconfigure(1, weight=1)
         settings.columnconfigure(3, weight=1)
-        ttk.Label(settings, text="Sample rate (Hz)").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Label(settings, text="Sample rate (Hz, 1-102400)").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
         ttk.Entry(settings, textvariable=self.sample_rate_var).grid(row=0, column=1, sticky="ew", padx=(0, 18), pady=5)
-        ttk.Label(settings, text="Range: 1-102400").grid(row=0, column=2, columnspan=2, sticky="w", pady=5)
+        ttk.Label(settings, text="Device").grid(row=0, column=2, sticky="w", padx=(0, 8), pady=5)
+        ttk.Combobox(settings, textvariable=self.device_var,
+                     values=("dev1", "dev2"), state="normal").grid(
+            row=0, column=3, sticky="ew", pady=5
+        )
         ttk.Label(settings, text="Samples per trigger").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
         ttk.Entry(settings, textvariable=self.points_var).grid(row=1, column=1, sticky="ew", padx=(0, 18), pady=5)
         ttk.Label(settings, text="Trigger input").grid(row=1, column=2, sticky="w", padx=(0, 8), pady=5)
@@ -860,6 +1057,7 @@ class DAQControlWindow:
                 voltage_range=INPUT_RANGES[self.channel_range_vars[name].get()])
                 for name in CHANNEL_NAMES}
             self.controller.update_config(
+                device_name=self.device_var.get(),
                 sample_rate=float(self.sample_rate_var.get()), points=int(self.points_var.get()),
                 trigger_source=self.trigger_var.get(), trigger_edge=self.edge_var.get(),
                 simulation=bool(self.simulation_var.get()), channels=channels,
@@ -889,10 +1087,11 @@ class DAQControlWindow:
         self.assistant_var.set(snapshot["assistant_status"])
         self.points_read_var.set(str(snapshot["points_read"]))
         self.capture_count_var.set(str(snapshot["capture_count"]))
-        error_message = snapshot["last_error"]
-        if not error_message and not snapshot["hardware_available"]:
-            error_message = snapshot["driver_error"]
-        self.error_var.set(error_message)
+        error_messages = [snapshot["last_error"]]
+        if not snapshot["hardware_available"]:
+            error_messages.append(snapshot["driver_error"])
+        error_messages.append(snapshot["settings_error"])
+        self.error_var.set(" | ".join(message for message in error_messages if message))
         self.root.after(250, self._refresh_status)
 
     def close(self) -> None:
