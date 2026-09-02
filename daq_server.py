@@ -1,181 +1,744 @@
-##POWERED BY YIMING MENG AND NOAM MANDIN##
-#####################################################
-###Make sure you have turned on the DAQ assistant.###
-#####################################################
-import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, HTMLResponse
+"""Local UI and HTTP data server for the Vkinging VE3664N DAQ."""
+
+from __future__ import annotations
+
+import argparse
 import ctypes
-from ctypes import *
-import numpy as np
-import time
+import math
+import os
+import random
+import shutil
+import subprocess
 import sys
 import threading
-import random
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-# --- 1. Import DAQ Driver ---
-# We try to import the proprietary C-library wrapper 'libvkdaq'
-try:
-    import libvkdaq
-    print("[DAQ Server] Library imported.")
-except Exception as e:
-    print(f"[DAQ Server] Error: {e}")
-    sys.exit(1)
+import numpy as np
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
-app = FastAPI()
-
-# --- 2. Global Shared Memory ---
-# Because data acquisition happens in a background thread and FastAPI serves requests 
-# in other threads, we use a dictionary and a Lock to safely share data between them.
-SHARED_MEMORY = {
-    "ch1": None,
-    "ch2": None, # The original demo only used CH1, but we sample CH2 here to prevent frontend web errors.
-    "timestamp": 0.0,
-    "lock": threading.Lock() # Prevents data corruption when reading/writing at the same time
+CHANNEL_NAMES = tuple(f"AIN{i}" for i in range(1, 5))
+TRIGGER_SOURCES = tuple(f"DIN1.{i}" for i in range(1, 5))
+INPUT_RANGES = {
+    "±10 V": 10.0, "±5 V": 5.0, "±2.5 V": 2.5, "±1 V": 1.0,
+    "±500 mV": 0.5, "±100 mV": 0.1, "±20 mV": 0.02,
 }
+MIN_SAMPLE_RATE = 1.0
+MAX_SAMPLE_RATE = 102_400.0
+MAX_POINTS = 2_000_000
+PROJECT_DIR = Path(__file__).resolve().parent
 
-# Default DAQ hardware configuration (Clone of the original demo: 400 points, 3990Hz)
-CONFIG = {
-    ###CHANGE HERE### if you want to change the sample rate and namber
-    "fsamp": 3990,      # Sampling frequency in Hz. 
-    "Npoint": 390,      # Number of points to read per trigger
-    "running": True,    # Controls the background worker loop
-    "needs_reinit": True # Flag to tell the worker to re-apply settings
-}
 
-# --- 3. Core Logic (Minimalist Demo Clone) ---
-def daq_worker_loop():
-    """
-    This function runs continuously in a background thread.
-    It communicates with the DAQ hardware via ctypes and updates SHARED_MEMORY.
-    """
-    print("[Worker] Started (Concise Demo Clone).")
-    
-    # Use a random task name to prevent conflicts if the server restarts quickly
-    task_name = f"VkDaqServer_{random.randint(1000,9999)}".encode('utf-8')
-    task_p = c_char_p(task_name)
-    task_created = False
-
-    while CONFIG["running"]:
+def _first_existing_file(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
         try:
-            # === Initialization Phase (Corresponds to the beginning of main() in the demo) ===
-            if CONFIG["needs_reinit"]:
-                # If a task already exists, stop and clear it before making a new one
+            if candidate.is_file():
+                return candidate.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def find_vkdaq_library(
+    platform_name: str | None = None,
+    environ: dict[str, str] | os._Environ[str] | None = None,
+) -> Path | None:
+    """Find the vendor shared library without loading it."""
+    platform_name = platform_name or sys.platform
+    environ = os.environ if environ is None else environ
+    is_windows = platform_name.startswith("win")
+    names = ("libvkdaq.dll", "vkdaq.dll") if is_windows else ("libvkdaq.so",)
+    candidates: list[Path] = []
+
+    explicit = environ.get("VKDAQ_LIBRARY")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+
+    home = environ.get("VKDAQ_HOME")
+    if home:
+        home_path = Path(home).expanduser()
+        candidates.extend(home_path / folder / name
+                          for folder in ("", "lib", "bin") for name in names)
+
+    for name in names:
+        executable = shutil.which(name, path=environ.get("PATH"))
+        if executable:
+            candidates.append(Path(executable))
+
+    if is_windows:
+        roots = [PROJECT_DIR, PROJECT_DIR / "windows_driver",
+                 PROJECT_DIR / "windows_installer"]
+        roots.extend(Path(value) for key in ("PROGRAMFILES", "PROGRAMFILES(X86)",
+                                              "LOCALAPPDATA")
+                     if (value := environ.get(key)))
+        vendor_folders = ("", "VKDAQ", "VkDaq", "Vkinging", "VK-DAQ")
+        for root in roots:
+            candidates.extend(root / vendor / folder / name
+                              for vendor in vendor_folders
+                              for folder in ("", "lib", "bin") for name in names)
+        for search_root in (PROJECT_DIR / "windows_driver",
+                            PROJECT_DIR / "windows_installer"):
+            if search_root.is_dir():
+                for name in names:
+                    candidates.extend(search_root.rglob(name))
+    else:
+        candidates.extend(Path("/opt/vkdaq") / folder / name
+                          for folder in ("lib", "bin") for name in names)
+
+    return _first_existing_file(candidates)
+
+
+def find_daq_assistant(
+    platform_name: str | None = None,
+    environ: dict[str, str] | os._Environ[str] | None = None,
+) -> Path | None:
+    """Find VkDaqAssistant on Windows or Linux."""
+    platform_name = platform_name or sys.platform
+    environ = os.environ if environ is None else environ
+    is_windows = platform_name.startswith("win")
+    name = "VkDaqAssistant.exe" if is_windows else "VkDaqAssistant"
+    candidates: list[Path] = []
+
+    explicit = environ.get("VKDAQ_ASSISTANT")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    home = environ.get("VKDAQ_HOME")
+    if home:
+        home_path = Path(home).expanduser()
+        candidates.extend(home_path / folder / name for folder in ("", "bin"))
+    executable = shutil.which(name, path=environ.get("PATH"))
+    if executable:
+        candidates.append(Path(executable))
+
+    if is_windows:
+        roots = [PROJECT_DIR, PROJECT_DIR / "windows_driver",
+                 PROJECT_DIR / "windows_installer"]
+        roots.extend(Path(value) for key in ("PROGRAMFILES", "PROGRAMFILES(X86)",
+                                              "LOCALAPPDATA")
+                     if (value := environ.get(key)))
+        for root in roots:
+            candidates.extend(root / vendor / folder / name
+                              for vendor in ("", "VKDAQ", "VkDaq", "Vkinging", "VK-DAQ")
+                              for folder in ("", "bin"))
+        for search_root in (PROJECT_DIR / "windows_driver",
+                            PROJECT_DIR / "windows_installer"):
+            if search_root.is_dir():
+                candidates.extend(search_root.rglob(name))
+    else:
+        candidates.append(Path("/opt/vkdaq/bin/VkDaqAssistant"))
+
+    return _first_existing_file(candidates)
+
+
+@dataclass
+class ChannelConfig:
+    enabled: bool
+    voltage_range: float = 0.5
+
+
+@dataclass
+class AcquisitionConfig:
+    sample_rate: float = 3990.0
+    points: int = 390
+    trigger_source: str = "DIN1.1"
+    trigger_edge: str = "rising"
+    simulation: bool = False
+    channels: dict[str, ChannelConfig] = field(default_factory=lambda: {
+        name: ChannelConfig(enabled=index < 2)
+        for index, name in enumerate(CHANNEL_NAMES)
+    })
+
+
+class DAQController:
+    """Owns DAQ state and serializes hardware access in one worker thread."""
+
+    def __init__(self, force_simulation: bool = False) -> None:
+        self.lock = threading.RLock()
+        self.wake_event = threading.Event()
+        self.shutdown_event = threading.Event()
+        self.config = AcquisitionConfig(simulation=force_simulation)
+        self.acquiring = False
+        self.needs_reinit = True
+        self.worker_thread: threading.Thread | None = None
+        self.driver: Any | None = None
+        self.driver_path = find_vkdaq_library()
+        self.driver_error = ""
+        self.assistant_path = find_daq_assistant()
+        self.assistant_process: subprocess.Popen[Any] | None = None
+        self.assistant_status = "Not started"
+        self.status = "Stopped"
+        self.last_error = ""
+        self.last_points = 0
+        self.capture_count = 0
+        self.timestamp = 0.0
+        self.data: dict[str, list[float] | None] = {name: None for name in CHANNEL_NAMES}
+        self._load_driver()
+
+    @property
+    def hardware_available(self) -> bool:
+        return self.driver is not None
+
+    def _load_driver(self) -> None:
+        if self.driver_path is None:
+            expected = "libvkdaq.dll or vkdaq.dll" if sys.platform.startswith("win") \
+                else "libvkdaq.so"
+            self.driver = None
+            self.driver_error = (
+                f"DAQ driver not found ({expected}). Set VKDAQ_LIBRARY or VKDAQ_HOME."
+            )
+            self.config.simulation = True
+            return
+        try:
+            os.environ["VKDAQ_LIBRARY"] = str(self.driver_path)
+            import libvkdaq
+            self.driver = libvkdaq
+        except BaseException as exc:
+            self.driver = None
+            self.driver_error = str(exc)
+            self.config.simulation = True
+
+    def start_worker(self) -> None:
+        with self.lock:
+            if self.worker_thread and self.worker_thread.is_alive():
+                return
+            self.shutdown_event.clear()
+            self.worker_thread = threading.Thread(
+                target=self._worker_loop, name="daq-worker", daemon=True
+            )
+            self.worker_thread.start()
+
+    def update_config(
+        self, *, sample_rate: float, points: int, trigger_source: str,
+        trigger_edge: str, simulation: bool, channels: dict[str, ChannelConfig],
+    ) -> None:
+        if not MIN_SAMPLE_RATE <= sample_rate <= MAX_SAMPLE_RATE:
+            raise ValueError(
+                f"Sample rate must be between {MIN_SAMPLE_RATE:g} and "
+                f"{MAX_SAMPLE_RATE:g} Hz"
+            )
+        if not 1 <= points <= MAX_POINTS:
+            raise ValueError(f"Samples per trigger must be between 1 and {MAX_POINTS}")
+        if trigger_source not in TRIGGER_SOURCES:
+            raise ValueError("Invalid trigger input")
+        if trigger_edge not in {"rising", "falling"}:
+            raise ValueError("Invalid trigger edge")
+        if not any(channel.enabled for channel in channels.values()):
+            raise ValueError("At least one analog input channel must be enabled")
+        if not simulation and not self.hardware_available:
+            raise ValueError(
+                f"DAQ driver unavailable: {self.driver_error or 'unknown error'}"
+            )
+
+        with self.lock:
+            self.config = AcquisitionConfig(
+                sample_rate=float(sample_rate), points=int(points),
+                trigger_source=trigger_source, trigger_edge=trigger_edge,
+                simulation=bool(simulation),
+                channels={name: ChannelConfig(channels[name].enabled, channels[name].voltage_range)
+                          for name in CHANNEL_NAMES},
+            )
+            self.needs_reinit = True
+            for name, channel in self.config.channels.items():
+                if not channel.enabled:
+                    self.data[name] = None
+            self.last_error = ""
+        self.wake_event.set()
+
+    def start_acquisition(self) -> None:
+        with self.lock:
+            self.acquiring = True
+            self.needs_reinit = True
+            self.status = "Initializing"
+            self.last_error = ""
+        self.wake_event.set()
+
+    def stop_acquisition(self) -> None:
+        with self.lock:
+            self.acquiring = False
+            self.needs_reinit = True
+            self.status = "Stopping"
+        self.wake_event.set()
+
+    def shutdown(self) -> None:
+        self.shutdown_event.set()
+        self.stop_acquisition()
+        thread = self.worker_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=2.5)
+
+    def launch_assistant(self) -> None:
+        with self.lock:
+            process = self.assistant_process
+            if process and process.poll() is None:
+                self.assistant_status = "Running"
+                return
+            self.assistant_path = self.assistant_path or find_daq_assistant()
+            if self.assistant_path is None:
+                self.assistant_status = (
+                    "Not found. Set VKDAQ_ASSISTANT to the executable path."
+                )
+                return
+            if sys.platform.startswith("win"):
+                command = [str(self.assistant_path)]
+                self.assistant_status = "Starting"
+            else:
+                command = ["sudo", str(self.assistant_path)]
+                self.assistant_status = (
+                    "Starting (enter the sudo password in the terminal if requested)"
+                )
+        try:
+            process = subprocess.Popen(
+                command, stdin=None, cwd=str(self.assistant_path.parent),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            with self.lock:
+                self.assistant_process = process
+                self.assistant_status = "Launch command sent"
+        except Exception as exc:
+            with self.lock:
+                self.assistant_status = f"Launch failed: {exc}"
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            process = self.assistant_process
+            assistant_status = self.assistant_status
+            if process and process.poll() is not None:
+                assistant_status = f"Exited (code {process.returncode})"
+                self.assistant_status = assistant_status
+            return {
+                "status": self.status, "acquiring": self.acquiring,
+                "mode": "simulation" if self.config.simulation else "hardware",
+                "hardware_available": self.hardware_available,
+                "driver_path": str(self.driver_path) if self.driver_path else None,
+                "driver_error": self.driver_error,
+                "assistant_path": (
+                    str(self.assistant_path) if self.assistant_path else None
+                ),
+                "assistant_status": assistant_status,
+                "sample_rate": self.config.sample_rate,
+                "points_requested": self.config.points,
+                "points_read": self.last_points,
+                "capture_count": self.capture_count,
+                "timestamp": self.timestamp,
+                "trigger_source": self.config.trigger_source,
+                "trigger_edge": self.config.trigger_edge,
+                "channels": {name: {"enabled": channel.enabled, "range": channel.voltage_range}
+                             for name, channel in self.config.channels.items()},
+                "last_error": self.last_error,
+            }
+
+    def channel_text(self, name: str) -> str:
+        with self.lock:
+            values = self.data[name]
+            timestamp = self.timestamp or time.time()
+            if values is None:
+                return f"{timestamp}\n0.0"
+            return f"{timestamp}\n" + "\n".join(f"{value:.6f}" for value in values)
+
+    def _config_snapshot(self) -> AcquisitionConfig:
+        with self.lock:
+            return AcquisitionConfig(
+                sample_rate=self.config.sample_rate, points=self.config.points,
+                trigger_source=self.config.trigger_source,
+                trigger_edge=self.config.trigger_edge,
+                simulation=self.config.simulation,
+                channels={name: ChannelConfig(channel.enabled, channel.voltage_range)
+                          for name, channel in self.config.channels.items()},
+            )
+
+    def _worker_loop(self) -> None:
+        task_name = f"VkDaqServer_{random.randint(1000, 9999)}".encode("utf-8")
+        task_pointer = ctypes.c_char_p(task_name)
+        task_created = False
+        while not self.shutdown_event.is_set():
+            with self.lock:
+                acquiring = self.acquiring
+            if not acquiring:
                 if task_created:
-                    libvkdaq.VkDaqStopTask(task_p)
-                    libvkdaq.VkDaqClearTask(task_p)
-                
-                Npoint = int(CONFIG["Npoint"])
-                fsamp = int(CONFIG["fsamp"])
-                
-                # 1. Create Task in the DAQ API
-                libvkdaq.VkDaqCreateTask(task_p)
-                task_created = True
-                
-                # 2. Configure Channels 
-                # The original demo only used AIN1, but we open two channels for server compatibility.
-                # Arguments: Task, Channel Name, Terminal Config, Min Val, Max Val, Units, Custom Scale
-                libvkdaq.VkDaqCreateAIVoltageChan(task_p, b"dev1/AIN1", b"", 0, -0.2, 0.2, 0, b"") ## CHANGE THE V limit "dev1 is your DAQ name which can be found and renamed in DAQ assistant. AIN1 is channel 1.
-                libvkdaq.VkDaqCreateAIVoltageChan(task_p, b"dev1/AIN2", b"", 0, -0.2, 0.2, 0, b"") ## CHANGE THE V limit
-                
-                # 3. Configure Sample Clock Timing 
-                # Arguments: Task, Source, Rate, ActiveEdge (1=Rising), SampleMode (1=Finite), SamplesPerChan
-                libvkdaq.VkDaqCfgSampClkTiming(task_p, 0, float(fsamp), 1, 1, Npoint)
-                
-                # 4. Configure Digital Edge Reference Trigger
-                libvkdaq.VkDaqCfgDigEdgeRefTrig(task_p, b"dev1/DIN1.1", 1, 0) 
-                
-                # 5. Start Task (Important: Start the task OUTSIDE the reading loop!)
-                libvkdaq.VkDaqStartTask(task_p)
-                print("[Worker] Task Started. Waiting for triggers...")
-                
-                # Reset the flag so we don't re-initialize on the next loop iteration
-                CONFIG["needs_reinit"] = False
+                    self._clear_task(task_pointer)
+                    task_created = False
+                with self.lock:
+                    self.status = "Stopped"
+                self.wake_event.wait(0.2)
+                self.wake_event.clear()
+                continue
 
-            # === Continuous Reading Phase (Corresponds to 'while True' in the demo) ===
-            
-            # Prepare a ctypes buffer array to hold the incoming C data (2 channels * Npoint)
-            pts = int(CONFIG["Npoint"])
-            data_buffer = (ctypes.c_double * (pts * 2))()
-            
-            # Read data from the DAQ 
-            # Arguments: Task, Buffer, Points to read, FillMode (1=GroupByChannel), Timeout (1.0s)
-            read = libvkdaq.VkDaqGetTaskData(task_p, data_buffer, pts, 1, 1.0)
-            
-            if read > 0:
-                print(f"[Worker] Captured {read} pts.")
-                
-                # Parse data from the raw ctypes buffer to a manageable numpy array
-                arr = np.ctypeslib.as_array(data_buffer)
-                
-                # Since FillMode is GroupByChannel (1), the first half of the array is CH1, 
-                # and the second half is CH2. We use a Lock here so FastAPI doesn't read half-written data.
-                with SHARED_MEMORY["lock"]:
-                    SHARED_MEMORY["ch1"] = arr[0:pts].tolist()
-                    SHARED_MEMORY["ch2"] = arr[pts:2*pts].tolist()
-                    SHARED_MEMORY["timestamp"] = time.time()
-                
-                # [Crucial] Simulate the delay of np.savetxt() from the original demo. 
-                # This slight delay gives the hardware a brief moment to breathe and 
-                # prevents it from triggering multiple times too rapidly.
-                time.sleep(0.05) 
-                
-        except Exception as e:
-            print(f"[Worker Error] {e}")
-            time.sleep(1) # Pause briefly to prevent console spamming on error
-            CONFIG["needs_reinit"] = True # Force re-initialization on the next loop
+            config = self._config_snapshot()
+            try:
+                if config.simulation:
+                    if task_created:
+                        self._clear_task(task_pointer)
+                        task_created = False
+                    with self.lock:
+                        self.needs_reinit = False
+                        self.status = "Simulated acquisition running"
+                    self._simulate_capture(config)
+                    continue
+                if self.driver is None:
+                    raise RuntimeError(self.driver_error or "DAQ driver unavailable")
 
-    # Cleanup: Stop and clear the task gracefully when the server shuts down
-    if task_created:
-        libvkdaq.VkDaqStopTask(task_p)
-        libvkdaq.VkDaqClearTask(task_p)
+                with self.lock:
+                    needs_reinit = self.needs_reinit
+                if needs_reinit:
+                    if task_created:
+                        self._clear_task(task_pointer)
+                        task_created = False
+                    self._configure_hardware(task_pointer, config)
+                    task_created = True
+                    with self.lock:
+                        self.needs_reinit = False
+                        self.status = "Waiting for trigger"
 
-# --- 4. FastAPI Startup & Endpoints ---
+                enabled_names = [name for name, channel in config.channels.items() if channel.enabled]
+                buffer = (ctypes.c_double * (config.points * len(enabled_names)))()
+                read = self.driver.VkDaqGetTaskData(task_pointer, buffer, config.points, 1, 1.0)
+                if read > 0:
+                    array = np.ctypeslib.as_array(buffer)
+                    captured = min(int(read), config.points)
+                    channel_data = {
+                        name: array[index * config.points:index * config.points + captured].tolist()
+                        for index, name in enumerate(enabled_names)
+                    }
+                    self._publish_capture(channel_data, captured, "Waiting for trigger")
+                    time.sleep(0.05)
+            except Exception as exc:
+                if task_created:
+                    self._clear_task(task_pointer)
+                    task_created = False
+                with self.lock:
+                    self.last_error = str(exc)
+                    self.status = "Acquisition error"
+                    self.needs_reinit = True
+                self.wake_event.wait(1.0)
+                self.wake_event.clear()
+        if task_created:
+            self._clear_task(task_pointer)
+
+    def _configure_hardware(self, task_pointer: ctypes.c_char_p, config: AcquisitionConfig) -> None:
+        assert self.driver is not None
+        self._check_result(self.driver.VkDaqCreateTask(task_pointer), "Create DAQ task")
+        try:
+            for name, channel in config.channels.items():
+                if not channel.enabled:
+                    continue
+                result = self.driver.VkDaqCreateAIVoltageChan(
+                    task_pointer, ctypes.c_char_p(f"dev1/{name}".encode()), ctypes.c_char_p(b""),
+                    0, -channel.voltage_range, channel.voltage_range, 0, ctypes.c_char_p(b""),
+                )
+                self._check_result(result, f"Configure {name}")
+            result = self.driver.VkDaqCfgSampClkTiming(
+                task_pointer, 0, config.sample_rate, 1, 1, config.points
+            )
+            self._check_result(result, "Configure sample clock")
+            edge = 1 if config.trigger_edge == "rising" else 0
+            result = self.driver.VkDaqCfgDigEdgeRefTrig(
+                task_pointer, ctypes.c_char_p(f"dev1/{config.trigger_source}".encode()), edge, 0
+            )
+            self._check_result(result, "Configure digital trigger")
+            self._check_result(self.driver.VkDaqStartTask(task_pointer), "Start DAQ task")
+        except Exception:
+            self._clear_task(task_pointer)
+            raise
+
+    @staticmethod
+    def _check_result(result: Any, action: str) -> None:
+        if isinstance(result, int) and result < 0:
+            raise RuntimeError(f"{action} failed; driver returned {result}")
+
+    def _clear_task(self, task_pointer: ctypes.c_char_p) -> None:
+        if self.driver is None:
+            return
+        try:
+            self.driver.VkDaqStopTask(task_pointer)
+        except Exception:
+            pass
+        try:
+            self.driver.VkDaqClearTask(task_pointer)
+        except Exception:
+            pass
+
+    def _simulate_capture(self, config: AcquisitionConfig) -> None:
+        enabled_names = [name for name, channel in config.channels.items() if channel.enabled]
+        t = np.arange(config.points, dtype=float) / config.sample_rate
+        capture_number = self.capture_count + 1
+        channel_data: dict[str, list[float]] = {}
+        for index, name in enumerate(enabled_names):
+            amplitude = config.channels[name].voltage_range * 0.2
+            frequency = 25.0 * (index + 1)
+            rng = np.random.default_rng(capture_number * 10 + index)
+            signal = amplitude * np.sin(2.0 * math.pi * frequency * t)
+            noise = rng.normal(0.0, max(amplitude * 0.01, 1e-7), config.points)
+            channel_data[name] = (signal + noise).tolist()
+        self._publish_capture(
+            channel_data, config.points, "Simulated acquisition running"
+        )
+        delay = min(max(config.points / config.sample_rate, 0.1), 1.0)
+        self.wake_event.wait(delay)
+        self.wake_event.clear()
+
+    def _publish_capture(self, channel_data: dict[str, list[float]], points: int, next_status: str) -> None:
+        with self.lock:
+            for name in CHANNEL_NAMES:
+                if name in channel_data:
+                    self.data[name] = channel_data[name]
+            self.timestamp = time.time()
+            self.last_points = points
+            self.capture_count += 1
+            self.status = next_status
+            self.last_error = ""
+
+
+controller = DAQController()
+app = FastAPI(title="VE3664N DAQ Server")
+
 
 @app.on_event("startup")
-def startup_event():
-    # Start the DAQ worker in a separate thread when the server starts.
-    # daemon=True means this thread will automatically close when the main program closes.
-    t = threading.Thread(target=daq_worker_loop, daemon=True)
-    t.start()
+def startup_event() -> None:
+    controller.start_worker()
+
 
 @app.on_event("shutdown")
-def shutdown_event():
-    # Tell the worker loop to stop safely
-    CONFIG["running"] = False
+def shutdown_event() -> None:
+    controller.shutdown()
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    status = controller.snapshot()
+    return ("<html><body><h1>VE3664N DAQ Server</h1>"
+            f"<p>Status: {status['status']}</p>"
+            f"<p>Last capture: {status['points_read']} points</p>"
+            "<p>Use the local control window to configure acquisition.</p></body></html>")
+
+
+@app.get("/status")
+def get_status() -> dict[str, Any]:
+    return controller.snapshot()
+
 
 @app.post("/configure")
-def configure(sample_rate: int = 3990, points: int = 400):
-    """ Allows users to dynamically change the DAQ parameters via an API call. """
-    CONFIG["fsamp"] = sample_rate
-    CONFIG["Npoint"] = points
-    CONFIG["needs_reinit"] = True
-    return {"status": "ok", "message": "Re-initializing with new settings..."}
+def configure(sample_rate: float = 3990, points: int = 400) -> dict[str, str]:
+    """Backward-compatible API for updating sample rate and point count."""
+    current = controller._config_snapshot()
+    try:
+        controller.update_config(
+            sample_rate=sample_rate, points=points,
+            trigger_source=current.trigger_source, trigger_edge=current.trigger_edge,
+            simulation=current.simulation, channels=current.channels,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok", "message": "Configuration updated"}
 
-# Keep the API endpoints unchanged so the existing frontend works smoothly.
-@app.get("/", response_class=HTMLResponse)
-def index(): 
-    return "<html><body><h1>DAQ Server (Demo Clone)</h1><p>Server is running.</p></body></html>"
+
+def _channel_response(name: str) -> PlainTextResponse:
+    return PlainTextResponse(controller.channel_text(name))
+
 
 @app.get("/ch1.dat", response_class=PlainTextResponse)
-def get_ch1():
-    """ Returns Channel 1 data in plain text format. """
-    with SHARED_MEMORY["lock"]:
-        if SHARED_MEMORY["ch1"] is None: 
-            return f"{time.time()}\n0.0"
-        
-        # Format: First line is the timestamp, followed by data points separated by newlines
-        return f"{SHARED_MEMORY['timestamp']}\n" + "\n".join([f"{v:.6f}" for v in SHARED_MEMORY["ch1"]])
+def get_ch1() -> PlainTextResponse:
+    return _channel_response("AIN1")
+
 
 @app.get("/ch2.dat", response_class=PlainTextResponse)
-def get_ch2():
-    """ Returns Channel 2 data in plain text format. """
-    with SHARED_MEMORY["lock"]:
-        if SHARED_MEMORY["ch2"] is None: 
-            return f"{time.time()}\n0.0"
-            
-        return f"{SHARED_MEMORY['timestamp']}\n" + "\n".join([f"{v:.6f}" for v in SHARED_MEMORY["ch2"]])
+def get_ch2() -> PlainTextResponse:
+    return _channel_response("AIN2")
+
+
+@app.get("/ch3.dat", response_class=PlainTextResponse)
+def get_ch3() -> PlainTextResponse:
+    return _channel_response("AIN3")
+
+
+@app.get("/ch4.dat", response_class=PlainTextResponse)
+def get_ch4() -> PlainTextResponse:
+    return _channel_response("AIN4")
+
+
+class DAQControlWindow:
+    def __init__(self, daq_controller: DAQController, server: uvicorn.Server) -> None:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+        self.tk, self.ttk, self.messagebox = tk, ttk, messagebox
+        self.controller, self.server = daq_controller, server
+        self.root = tk.Tk()
+        self.root.title("VE3664N DAQ Controller")
+        self.root.geometry("720x600")
+        self.root.minsize(680, 560)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        config = self.controller._config_snapshot()
+        self.sample_rate_var = tk.StringVar(value=f"{config.sample_rate:g}")
+        self.points_var = tk.StringVar(value=str(config.points))
+        self.trigger_var = tk.StringVar(value=config.trigger_source)
+        self.edge_var = tk.StringVar(value=config.trigger_edge)
+        self.simulation_var = tk.BooleanVar(value=config.simulation)
+        self.channel_enabled_vars: dict[str, Any] = {}
+        self.channel_range_vars: dict[str, Any] = {}
+        self.status_var = tk.StringVar(value="Starting")
+        self.assistant_var = tk.StringVar(value="Starting")
+        self.mode_var = tk.StringVar(value="")
+        self.points_read_var = tk.StringVar(value="0")
+        self.capture_count_var = tk.StringVar(value="0")
+        self.error_var = tk.StringVar(value="")
+        self._build_ui(config)
+        self.root.after(200, self._refresh_status)
+
+    def _build_ui(self, config: AcquisitionConfig) -> None:
+        ttk = self.ttk
+        root_frame = ttk.Frame(self.root, padding=16)
+        root_frame.pack(fill="both", expand=True)
+        root_frame.columnconfigure(0, weight=1)
+        ttk.Label(root_frame, text="VE3664N DAQ Controller", font=("Sans", 18, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 12))
+
+        status_frame = ttk.LabelFrame(root_frame, text="System Status", padding=10)
+        status_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        status_frame.columnconfigure(1, weight=1)
+        self._status_row(status_frame, 0, "DAQ:", self.status_var)
+        self._status_row(status_frame, 1, "Mode:", self.mode_var)
+        self._status_row(status_frame, 2, "DAQ Assistant:", self.assistant_var)
+        self._status_row(status_frame, 3, "Last sample count:", self.points_read_var)
+        self._status_row(status_frame, 4, "Captured frames:", self.capture_count_var)
+
+        settings = ttk.LabelFrame(root_frame, text="Acquisition Settings", padding=10)
+        settings.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        settings.columnconfigure(1, weight=1)
+        settings.columnconfigure(3, weight=1)
+        ttk.Label(settings, text="Sample rate (Hz)").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Entry(settings, textvariable=self.sample_rate_var).grid(row=0, column=1, sticky="ew", padx=(0, 18), pady=5)
+        ttk.Label(settings, text="Range: 1-102400").grid(row=0, column=2, columnspan=2, sticky="w", pady=5)
+        ttk.Label(settings, text="Samples per trigger").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=5)
+        ttk.Entry(settings, textvariable=self.points_var).grid(row=1, column=1, sticky="ew", padx=(0, 18), pady=5)
+        ttk.Label(settings, text="Trigger input").grid(row=1, column=2, sticky="w", padx=(0, 8), pady=5)
+        ttk.Combobox(settings, textvariable=self.trigger_var, values=TRIGGER_SOURCES, state="readonly").grid(row=1, column=3, sticky="ew", pady=5)
+        ttk.Label(settings, text="Trigger edge").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=5)
+        edge_frame = ttk.Frame(settings)
+        edge_frame.grid(row=2, column=1, sticky="w", pady=5)
+        ttk.Radiobutton(edge_frame, text="Rising", variable=self.edge_var, value="rising").pack(side="left")
+        ttk.Radiobutton(edge_frame, text="Falling", variable=self.edge_var, value="falling").pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(settings, text="Simulation mode", variable=self.simulation_var).grid(row=2, column=2, columnspan=2, sticky="w", pady=5)
+
+        channels_frame = ttk.LabelFrame(root_frame, text="Analog Input Channels", padding=10)
+        channels_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        channels_frame.columnconfigure(2, weight=1)
+        ttk.Label(channels_frame, text="Channel").grid(row=0, column=0, sticky="w", padx=(0, 20))
+        ttk.Label(channels_frame, text="Enabled").grid(row=0, column=1, sticky="w", padx=(0, 20))
+        ttk.Label(channels_frame, text="Input range").grid(row=0, column=2, sticky="w")
+        for row, name in enumerate(CHANNEL_NAMES, start=1):
+            enabled_var = self.tk.BooleanVar(value=config.channels[name].enabled)
+            range_label = next(label for label, value in INPUT_RANGES.items()
+                               if value == config.channels[name].voltage_range)
+            range_var = self.tk.StringVar(value=range_label)
+            self.channel_enabled_vars[name] = enabled_var
+            self.channel_range_vars[name] = range_var
+            ttk.Label(channels_frame, text=name).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Checkbutton(channels_frame, variable=enabled_var).grid(row=row, column=1, sticky="w", pady=4)
+            ttk.Combobox(channels_frame, textvariable=range_var, values=list(INPUT_RANGES),
+                         state="readonly", width=18).grid(row=row, column=2, sticky="w", pady=4)
+
+        button_frame = ttk.Frame(root_frame)
+        button_frame.grid(row=4, column=0, sticky="ew", pady=(2, 8))
+        ttk.Button(button_frame, text="Apply Settings", command=self.apply_config).pack(side="left")
+        ttk.Button(button_frame, text="Start Acquisition", command=self.start).pack(side="left", padx=(8, 0))
+        ttk.Button(button_frame, text="Stop Acquisition", command=self.stop).pack(side="left", padx=(8, 0))
+        ttk.Button(button_frame, text="Launch DAQ Assistant",
+                   command=self.controller.launch_assistant).pack(side="right")
+        ttk.Label(root_frame, textvariable=self.error_var, foreground="#b00020",
+                  wraplength=660).grid(row=5, column=0, sticky="ew")
+
+    def _status_row(self, frame: Any, row: int, label: str, variable: Any) -> None:
+        self.ttk.Label(frame, text=label).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=2)
+        self.ttk.Label(frame, textvariable=variable).grid(row=row, column=1, sticky="nw", pady=2)
+
+    def apply_config(self, show_confirmation: bool = True) -> bool:
+        try:
+            channels = {name: ChannelConfig(
+                enabled=bool(self.channel_enabled_vars[name].get()),
+                voltage_range=INPUT_RANGES[self.channel_range_vars[name].get()])
+                for name in CHANNEL_NAMES}
+            self.controller.update_config(
+                sample_rate=float(self.sample_rate_var.get()), points=int(self.points_var.get()),
+                trigger_source=self.trigger_var.get(), trigger_edge=self.edge_var.get(),
+                simulation=bool(self.simulation_var.get()), channels=channels,
+            )
+            self.error_var.set("")
+            if show_confirmation:
+                self.status_var.set("Settings applied")
+            return True
+        except (ValueError, KeyError) as exc:
+            self.error_var.set(str(exc))
+            self.messagebox.showerror("Invalid Settings", str(exc))
+            return False
+
+    def start(self) -> None:
+        if self.apply_config(show_confirmation=False):
+            self.controller.start_acquisition()
+
+    def stop(self) -> None:
+        self.controller.stop_acquisition()
+
+    def _refresh_status(self) -> None:
+        snapshot = self.controller.snapshot()
+        self.status_var.set(snapshot["status"])
+        self.mode_var.set(
+            "Simulation" if snapshot["mode"] == "simulation" else "Hardware DAQ"
+        )
+        self.assistant_var.set(snapshot["assistant_status"])
+        self.points_read_var.set(str(snapshot["points_read"]))
+        self.capture_count_var.set(str(snapshot["capture_count"]))
+        error_message = snapshot["last_error"]
+        if not error_message and not snapshot["hardware_available"]:
+            error_message = snapshot["driver_error"]
+        self.error_var.set(error_message)
+        self.root.after(250, self._refresh_status)
+
+    def close(self) -> None:
+        self.controller.shutdown()
+        self.server.should_exit = True
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="VE3664N DAQ control server")
+    parser.add_argument("--simulation", action="store_true", help="force simulation mode")
+    parser.add_argument("--no-ui", action="store_true", help="run only the HTTP server")
+    parser.add_argument("--no-assistant", action="store_true", help="do not launch DAQ Assistant")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8001)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.simulation:
+        with controller.lock:
+            controller.config.simulation = True
+    if not args.no_assistant:
+        controller.launch_assistant()
+    if args.no_ui:
+        uvicorn.run(app, host=args.host, port=args.port)
+        return
+
+    config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+    server = uvicorn.Server(config)
+    server_thread = threading.Thread(target=server.run, name="http-server", daemon=True)
+    server_thread.start()
+    try:
+        DAQControlWindow(controller, server).run()
+    except Exception as exc:
+        server.should_exit = True
+        controller.shutdown()
+        print(f"Unable to start local UI: {exc}", file=sys.stderr)
+        raise
+
 
 if __name__ == "__main__":
-    # Start the web server on all network interfaces (0.0.0.0) at port 8001
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    main()

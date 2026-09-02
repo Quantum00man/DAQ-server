@@ -1,6 +1,9 @@
 # DAQ Server Project
 
-This repository contains the software, drivers, and documentation needed to set up and run a Data Acquisition (DAQ) server. The main application (`daq_server.py`) uses FastAPI to continuously read data from the DAQ hardware via a background worker thread and serves it over HTTP endpoints.
+This repository contains the software, drivers, and documentation needed to run a
+VE3664N data-acquisition server. The main application (`daq_server.py`) provides a
+local Tkinter control window while a FastAPI server continues to expose the latest
+captured frame over HTTP.
 
 ## 📁 Project Structure
 
@@ -33,20 +36,71 @@ Ensure you have Python 3 installed on your system. You will need to install a fe
 
 ---
 
-## 🚀 How to Run the DAQ Server
+## 🚀 How to Run the DAQ Controller
 
 Once your hardware drivers are installed and your Python environment is ready, you can start the DAQ server.
 
 1. Open a terminal and navigate to the project's root directory (where `daq_server.py` is located).
-2. Run the server script:
+2. Run the controller from a terminal on Linux:
 
     python3 daq_server.py
 
-3. The terminal will display startup logs. If successful, it will indicate that the worker thread has started and the Uvicorn server is running on port `8001`.
-4. You can now access the DAQ data by opening your web browser or using a tool like `curl`:
+   Or run it from PowerShell or Command Prompt on Windows:
+
+    py daq_server.py
+
+3. On Linux, the program runs `sudo /opt/vkdaq/bin/VkDaqAssistant`. Enter the sudo
+   password in the terminal if requested. On Windows, it searches for and starts
+   `VkDaqAssistant.exe` directly. The local control window then lets you:
+   * enable any combination of AIN1 through AIN4;
+   * select an independent voltage range for every channel;
+   * enter any sampling rate from 1 to 102400 Hz;
+   * change the number of points acquired after each trigger;
+   * choose DIN1.1 through DIN1.4 and a rising or falling trigger edge;
+   * apply parameters and start or stop acquisition; and
+   * use simulated data when the driver or hardware is unavailable.
+4. The HTTP server remains available on port `8001`:
     * **Server Status:** `http://localhost:8001/`
+    * **JSON Status:** `http://localhost:8001/status`
     * **Channel 1 Data Stream:** `http://localhost:8001/ch1.dat`
     * **Channel 2 Data Stream:** `http://localhost:8001/ch2.dat`
+    * **Channel 3 Data Stream:** `http://localhost:8001/ch3.dat`
+    * **Channel 4 Data Stream:** `http://localhost:8001/ch4.dat`
+
+The `.dat` endpoints keep the original format: the first line is the Unix timestamp
+and each following line is one sample from the latest frame. No `.dat` file is written
+to disk. A disabled channel returns a timestamp followed by `0.0`.
+
+For development without a DAQ or without starting DAQ Assistant, use:
+
+    python3 daq_server.py --simulation --no-assistant
+
+On Windows, use:
+
+    py daq_server.py --simulation --no-assistant
+
+For a headless HTTP-only process, add `--no-ui`.
+
+### Windows driver discovery
+
+The Windows UI and simulation mode work without the vendor driver. For real hardware,
+the application searches for `libvkdaq.dll` or `vkdaq.dll` in:
+
+* the path specified by `VKDAQ_LIBRARY`;
+* `VKDAQ_HOME`, including its `lib` and `bin` subfolders;
+* the system `PATH`;
+* this project's `windows_driver` and `windows_installer` folders; and
+* common Vkinging/VkDaq folders under Program Files and Local AppData.
+
+It searches for `VkDaqAssistant.exe` in the same locations. Exact paths can be set in
+PowerShell before launching the controller:
+
+    $env:VKDAQ_LIBRARY = "C:\path\to\libvkdaq.dll"
+    $env:VKDAQ_ASSISTANT = "C:\path\to\VkDaqAssistant.exe"
+    py daq_server.py
+
+Keep dependent vendor DLLs beside `libvkdaq.dll`; Python registers that directory for
+Windows DLL dependency loading automatically.
 
 ### 🛠️ Troubleshooting & Testing
 
